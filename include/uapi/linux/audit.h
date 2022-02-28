@@ -71,6 +71,7 @@
 #define AUDIT_TTY_SET		1017	/* Set TTY auditing status */
 #define AUDIT_SET_FEATURE	1018	/* Turn an audit feature on or off */
 #define AUDIT_GET_FEATURE	1019	/* Get which features are enabled */
+#define AUDIT_INTEGRITY_PROOFS_FIRST_KEY	1020 /* Receive the first key of integrity key set*/
 
 #define AUDIT_FIRST_USER_MSG	1100	/* Userspace messages mostly uninteresting to kernel */
 #define AUDIT_USER_AVC		1107	/* We filter this differently */
@@ -347,6 +348,7 @@ enum {
 #define AUDIT_STATUS_BACKLOG_WAIT_TIME		0x0020
 #define AUDIT_STATUS_LOST			0x0040
 #define AUDIT_STATUS_BACKLOG_WAIT_TIME_ACTUAL	0x0080
+#define AUDIT_STATUS_INTEGRITY_PROOFS	0x0100
 
 #define AUDIT_FEATURE_BITMAP_BACKLOG_LIMIT	0x00000001
 #define AUDIT_FEATURE_BITMAP_BACKLOG_WAIT_TIME	0x00000002
@@ -476,6 +478,7 @@ struct audit_status {
 	__u32           backlog_wait_time_actual;/* time spent waiting while
 						  * message limit exceeded
 						  */
+	__u32		integrity_proofs; /* Integrity proofs activated */
 };
 
 struct audit_features {
@@ -485,6 +488,8 @@ struct audit_features {
 	__u32	features;	/* which feature to enable/disable */
 	__u32	lock;		/* which features to lock */
 };
+
+#define INTEGRITY_PROOFS_OFF	0
 
 #define AUDIT_FEATURE_ONLY_UNSET_LOGINUID	0
 #define AUDIT_FEATURE_LOGINUID_IMMUTABLE	1

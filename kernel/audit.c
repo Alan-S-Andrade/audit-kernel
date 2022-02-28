@@ -62,6 +62,11 @@
 
 #include "audit.h"
 
+/* Kernel log integrity required headers */
+#include <crypto/internal/blake2b.h>
+#include <linux/random.h>
+#include <linux/siphash.h>
+
 /* No auditing will take place until audit_initialized == AUDIT_INITIALIZED.
  * (Initialization happens after skb_init is called.) */
 #define AUDIT_DISABLED		-1
@@ -82,6 +87,9 @@ static u32	audit_failure = AUDIT_FAIL_PRINTK;
 
 /* private audit network namespace index */
 static unsigned int audit_net_id;
+
+/* Kernel log integrity status (on or off) */
+u32		integrity_proofs = INTEGRITY_PROOFS_OFF;
 
 /**
  * struct audit_net - audit private network namespace data
@@ -207,6 +215,68 @@ struct audit_reply {
 	struct net *net;
 	struct sk_buff *skb;
 };
+
+/* KEYS_PER_SET is the number of cryptographic keys that we store in each
+ * set of precomputed keys for the kernel log integrity feature.
+ */
+#define KEYS_PER_SET 100000
+
+static DECLARE_WAIT_QUEUE_HEAD(precompute_wait);
+static atomic_t precompute_go = ATOMIC_INIT(1);
+
+static siphash_key_t left[KEYS_PER_SET];   // each key is a u64 key[2]
+static siphash_key_t right[KEYS_PER_SET];   // each key is a u64 key[2]
+static siphash_key_t *log_integrity_key_set = left;
+static siphash_key_t *log_integrity_precomputed_key_set = right;
+
+static size_t key_len;
+static int key_index;
+siphash_key_t first_key;
+struct blake2b_state blake_state;
+
+struct task_struct *precompute_tsk;
+
+/* Source:
+ * Dead Store Elimination (Still) Considered Harmful, USENIX 2017
+ * https://compsec.sysnet.ucsd.edu/secure_memzero.h
+ */
+void erase_from_memory(void *pointer, size_t size_data)
+{
+	volatile uint8_t *p = pointer;
+	while (size_data--)
+		*p++ = 0;
+}
+
+static int audit_precompute_keys(void *arg)
+{
+	siphash_key_t latest_key = log_integrity_key_set[KEYS_PER_SET-1];
+
+	while (!kthread_should_stop()) {
+
+		/* Generate KEYS_PER_SET keys and save them to the set */
+		struct blake2b_state blake_state;
+		int curr_key;
+
+		for (curr_key = 0; curr_key < KEYS_PER_SET; curr_key++) {
+			__blake2b_init(&blake_state, key_len, &latest_key, key_len);
+			__blake2b_update(&blake_state, (uint8_t *) &latest_key, key_len,
+						blake2b_compress_generic);
+			__blake2b_final(&blake_state, (uint8_t *) &latest_key,
+						blake2b_compress_generic);
+
+			log_integrity_precomputed_key_set[curr_key] = latest_key;
+		}
+
+		/* Mark this computation as done */
+		atomic_set(&precompute_go, 0);
+
+		/* Wait until there are new keys to precompute */
+		wait_event_interruptible(precompute_wait, (atomic_read(&precompute_go) == 1) ||
+						kthread_should_stop());
+	}
+
+	return 0;
+}
 
 /**
  * auditd_test_task - Check to see if a given task is an audit daemon
@@ -1051,6 +1121,53 @@ static int audit_netlink_ok(struct sk_buff *skb, u16 msg_type)
 	return err;
 }
 
+static int audit_set_integrity_proofs(struct sk_buff *skb, u32 state)
+{
+	int rc, i;
+	siphash_key_t curr_key;
+	u32 seq;
+
+	seq = nlmsg_hdr(skb)->nlmsg_seq;
+	rc = audit_do_config_change("integrity_proofs", &integrity_proofs, state);
+	if (state != INTEGRITY_PROOFS_OFF) {
+
+		/* First time activating Integrity Proofs */
+		if (siphash_key_is_zero(&first_key)) {
+
+			/* Generate first key */
+			key_len = sizeof(first_key);
+			get_random_bytes(&first_key, key_len);
+
+			/* Send First Key to userspace */
+			audit_send_reply(skb, seq, AUDIT_INTEGRITY_PROOFS_FIRST_KEY,
+						0, 0, &first_key, key_len);
+
+			/* Precompute first set synchronously */
+			curr_key = first_key;
+			for (i = 0; i < KEYS_PER_SET; i++) {
+				__blake2b_init(&blake_state, key_len, &curr_key, key_len);
+				__blake2b_update(&blake_state, (uint8_t *) &curr_key,
+						key_len, blake2b_compress_generic);
+				__blake2b_final(&blake_state, (uint8_t *) &curr_key,
+					blake2b_compress_generic);
+
+				log_integrity_key_set[i] = curr_key;
+			}
+
+			/* Precompute second set asynchronously */
+			precompute_tsk = kthread_run(audit_precompute_keys, NULL,
+					"audit_precompute_keys");
+			if (IS_ERR(precompute_tsk)) {
+				int err = PTR_ERR(precompute_tsk);
+				panic("audit: failed to start the precompute_tsk thread (%d)\n",
+					   err);
+			}
+		}
+	}
+
+	return rc;
+}
+
 static void audit_log_common_recv_msg(struct audit_context *context,
 					struct audit_buffer **ab, u16 msg_type)
 {
@@ -1215,6 +1332,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 		s.feature_bitmap	   = AUDIT_FEATURE_BITMAP_ALL;
 		s.backlog_wait_time	   = audit_backlog_wait_time;
 		s.backlog_wait_time_actual = atomic_read(&audit_backlog_wait_time_actual);
+		s.integrity_proofs = integrity_proofs;
 		audit_send_reply(skb, seq, AUDIT_GET, 0, 0, &s, sizeof(s));
 		break;
 	}
@@ -1323,6 +1441,11 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 
 			audit_log_config_change("backlog_wait_time_actual", 0, actual, 1);
 			return actual;
+		}
+		if (s.mask == AUDIT_STATUS_INTEGRITY_PROOFS) {
+			err = audit_set_integrity_proofs(skb, s.integrity_proofs);
+			if (err < 0)
+				return err;
 		}
 		break;
 	}
@@ -2371,11 +2494,65 @@ void audit_log_end(struct audit_buffer *ab)
 {
 	struct sk_buff *skb;
 	struct nlmsghdr *nlh;
+	char *log_msg;	// log message
+	size_t log_msg_len;
+	u64 integrity_proof;
+	unsigned long flags;
+	siphash_key_t *swap;
+	int generate_proof;
 
 	if (!ab)
 		return;
 
 	if (audit_rate_check()) {
+		/* Get the netlink header and content of skb */
+		nlh = nlmsg_hdr(ab->skb);
+		log_msg = nlmsg_data(nlh);
+		log_msg_len = strlen(log_msg);
+
+		/* Check feature is enabled and that the given audit record
+		 * is not of type AUDIT_EOE
+		 */
+		generate_proof = integrity_proofs != INTEGRITY_PROOFS_OFF &&
+			nlh->nlmsg_type != AUDIT_EOE;
+
+		if (generate_proof) {
+
+			/* Perform the cryptographic operations synchronously */
+			spin_lock_irqsave(&(&audit_queue)->lock, flags);
+
+			/* Compute proof of integrity */
+			integrity_proof = siphash(log_msg, log_msg_len,
+				&(log_integrity_key_set[key_index]));
+
+			/* Erase used key from memory */
+			erase_from_memory(&(log_integrity_key_set[key_index]), key_len);
+
+			/* Add MAC to log event */
+			audit_log_format(ab, " p=%llx", integrity_proof);
+
+			/* Check if all keys are used */
+			if (++key_index == KEYS_PER_SET) {
+
+				/* Wait for current precomputation to end */
+				while (atomic_read(&precompute_go) == 1) {
+				}
+
+				/* Set new set and new key index */
+				swap = log_integrity_key_set;
+				log_integrity_key_set = log_integrity_precomputed_key_set;
+				log_integrity_precomputed_key_set = swap;
+				key_index = 0;
+
+				/* Signal precomputing thread to precompute new keys */
+				atomic_set(&precompute_go, 1);
+
+				/* Wake up precomputing thread */
+				wake_up(&precompute_wait);
+			}
+		}
+
+		/* Ready to append log event to sending queue */
 		skb = ab->skb;
 		ab->skb = NULL;
 
@@ -2384,8 +2561,16 @@ void audit_log_end(struct audit_buffer *ab)
 		nlh = nlmsg_hdr(skb);
 		nlh->nlmsg_len = skb->len - NLMSG_HDRLEN;
 
-		/* queue the netlink packet and poke the kauditd thread */
-		skb_queue_tail(&audit_queue, skb);
+		if (generate_proof) {
+			/* queue the netlink packet */
+			__skb_queue_tail(&audit_queue, skb);
+			/* Done with the cryptographic operations */
+			spin_unlock_irqrestore(&(&audit_queue)->lock, flags);
+		} else
+			/* queue the netlink packet */
+			skb_queue_tail(&audit_queue, skb);
+
+		/* poke the kauditd thread */
 		wake_up_interruptible(&kauditd_wait);
 	} else
 		audit_log_lost("rate limit exceeded");
